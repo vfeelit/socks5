@@ -1,0 +1,243 @@
+#!/usr/bin/env php
+<?php
+
+require_once __DIR__ . '/../vendor/autoload.php';
+
+use \Workerman\Worker;
+use \Workerman\Connection\TcpConnection;
+use \Workerman\Connection\AsyncTcpConnection;
+
+\Dotenv\Dotenv::create(__DIR__ . '/../')->load();
+
+class App
+{
+    const STAGE_INIT = 0;
+    const STAGE_AUTH = 1;
+    const STAGE_ADDR = 2;
+    const STAGE_UDP_ASSOC = 3;
+    const STAGE_DNS = 4;
+    const STAGE_CONNECTING = 5;
+    const STAGE_STREAM = 6;
+    const STAGE_DESTROYED = -1;
+
+    const CMD_CONNECT = 1;
+    const CMD_BIND = 2;
+    const CMD_UDP_ASSOCIATE = 3;
+
+    const ADDRTYPE_IPV4 = 1;
+    const ADDRTYPE_IPV6 = 4;
+    const ADDRTYPE_HOST = 3;
+
+    const METHOD_NO_AUTH = 0;
+    const METHOD_GSSAPI = 1;
+    const METHOD_USER_PASS = 2;
+
+    private $config = [];
+
+    private static $instance = null;
+
+    private function __construct($config)
+    {
+        $this->config = $config;
+        if (!empty($this->config['daemonize'])) {
+            \Workerman\Worker::$daemonize = true;
+        }
+        if (!empty($this->config['pid_file'])) {
+            \Workerman\Worker::$pidFile = $this->config['pid_file'];
+        }
+        if (!empty($this->config['stdout'])) {
+            \Workerman\Worker::$stdoutFile = $this->config['stdout'];
+        }
+        if (!empty($this->config['log_file'])) {
+            \Workerman\Worker::$logFile = $this->config['log_file'];
+        }
+        if (!empty($this->config['max_package_size'])) {
+            \Workerman\Connection\TcpConnection::$defaultMaxPackageSize = $this->config['max_package_size'];
+        }
+        if (!empty($this->config['max_send_buffer_size'])) {
+            \Workerman\Connection\TcpConnection::$defaultMaxSendBufferSize = $this->config['max_send_buffer_size'];
+        }
+    }
+
+    public static function instance($config)
+    {
+        if (self::$instance instanceof App) {
+            return self::$instance;
+        }
+        self::$instance = new static($config);
+        return self::$instance;
+    }
+
+    public function run()
+    {
+        $options = [];
+        if (!empty($this->config['context_option']) && is_array($this->config['context_option'])) {
+            $options = $this->config['context_option'];
+        }
+        $worker = new \Workerman\Worker($this->config['listen'], $options);
+        $worker->reusePort = true;
+        if (!empty($this->config['worker_user'])) {
+            $worker->user = $this->config['worker_user'];
+        }
+        if (!empty($this->config['worker_group'])) {
+            $worker->group = $this->config['worker_group'];
+        }
+        if (!empty($this->config['name'])) {
+            $worker->name = $this->config['name'];
+        }
+        $worker->count = (isset($this->config['worker_count']) && ((int)$this->config['worker_count'] > 0)) ? (int)$this->config['worker_count'] : 1;
+        $this->configSocket($worker->getMainSocket(), $worker->transport);
+        $worker->onWorkerStart = ['App', 'workerStart'];
+        $worker->onWorkerStop = ['App', 'workerStop'];
+        $worker->onConnect = ['App', 'connect'];
+        $worker->onMessage = ['App', 'message'];
+        $worker->onClose = ['App', 'close'];
+        \Workerman\Worker::runAll();
+    }
+
+    private function configSocket($socket, $transport = '')
+    {
+        if (!empty($this->config['socket'])) {
+            if (function_exists('socket_import_stream') && $transport === 'tcp') {
+                set_error_handler(function () {
+                });
+                $socket = socket_import_stream($socket);
+                foreach ($this->config['socket'] as $optname => $optval) {
+                    if (defined($optname)) {
+                        socket_set_option($socket, SOL_TCP, constant($optname), $optval);
+                        socket_set_option($socket, SOL_SOCKET, constant($optname), $optval);
+                    }
+                }
+                restore_error_handler();
+            }
+        }
+    }
+
+    public static function parseSocket5Header($buffer)
+    {
+        $addressType = ord($buffer[3]);
+        switch ($addressType) {
+            case self::ADDRTYPE_IPV4:
+                if (strlen($buffer) < 10) {
+                    echo bin2hex($buffer) . "\n";
+                    return false;
+                }
+                $destinationAddress = ord($buffer[4]) . '.' . ord($buffer[5]) . '.' . ord($buffer[6]) . '.' . ord($buffer[7]);
+                $portData = unpack('n', substr($buffer, -2));
+                $destinationPort = $portData[1];
+                $headerLength = 10;
+                break;
+            case self::ADDRTYPE_HOST:
+                $addressLen = ord($buffer[4]);
+                if (strlen($buffer) < $addressLen + 5) {
+                    echo $buffer . "\n";
+                    echo bin2hex($buffer) . "\n";
+                    return false;
+                }
+                $destinationAddress = substr($buffer, 5, $addressLen);
+                $portData = unpack('n', substr($buffer, -2));
+                $destinationPort = $portData[1];
+                $headerLength = $addressLen + 7;
+                break;
+            case self::ADDRTYPE_IPV6:
+                if (strlen($buffer) < 22) {
+                    return false;
+                }
+                return false;
+            default:
+                echo "unsupported address type $addressType\n";
+                return false;
+        }
+        return array($addressType, $destinationAddress, $destinationPort, $headerLength);
+    }
+
+    public static function workerStart($worker)
+    {
+        //$worker->config = self::$config;
+    }
+
+    public static function workerStop($connection)
+    {
+    }
+
+    public static function connect($connection)
+    {
+        $connection->stage = self::STAGE_INIT;
+    }
+
+    public static function message(TcpConnection $connection, $buffer)
+    {
+        $worker = $connection->worker;
+        if (!isset($connection->stage)) {
+            $connection->stage = self::STAGE_INIT;
+        }
+        switch ($connection->stage) {
+            case self::STAGE_INIT:
+                if (false) {
+                    $methodsLen = ord($buffer[1]);
+                    $methods = array();
+                    for ($i = 0; $i < strlen($buffer) - 3; $i++) {
+                        array_push($methods, ord($buffer[$i + 3]));
+                    }
+                    if (in_array('method', $methods)) {
+                        $connection->send("\x05\x02");
+                        $connection->stage = self::STAGE_AUTH;
+                        return;
+                    }
+                    $connection->send("\x05\xff");
+                    $connection->stage = self::STAGE_DESTROYED;
+                    $connection->close();
+                    return;
+                }
+                $connection->send("\x05\x00");
+                $connection->stage = self::STAGE_ADDR;
+                return;
+            case self::STAGE_AUTH:
+                $userLen = ord($buffer[1]);
+                $user = substr($buffer, 2, $userLen);
+                $passLen = ord($buffer[2 + $userLen]);
+                $pass = substr($buffer, 3 + $userLen, $passLen);
+                if ($user == 'user' && $pass == 'password') {
+                    $connection->send("\x05\x00");
+                    $connection->stage = self::STAGE_ADDR;
+                    return;
+                }
+                $connection->send("\x05\x01");
+                $connection->stage = self::STAGE_DESTROYED;
+                $connection->close();
+                return;
+            case self::STAGE_ADDR:
+                $cmd = ord($buffer[1]);
+                if ($cmd != self::CMD_CONNECT) {
+                    $connection->close();
+                    return;
+                }
+                $headerData = self::parseSocket5Header($buffer);
+                if (!$headerData) {
+                    $connection->close();
+                    return;
+                }
+                $connection->stage = self::STAGE_CONNECTING;
+                $remoteConnection = new AsyncTcpConnection('tcp://' . $headerData[1] . ':' . $headerData[2]);
+                $remoteConnection->onConnect = function (AsyncTcpConnection $remoteConnection) use ($connection) {
+                    $connection->state = self::STAGE_STREAM;
+                    $connection->send("\x05\x00\x00\x01\x00\x00\x00\x00\x10\x10");
+                    $connection->pipe($remoteConnection);
+                    $remoteConnection->pipe($connection);
+                };
+                $remoteConnection->connect();
+        }
+    }
+
+    public static function close($connection)
+    {
+    }
+}
+
+// RUN
+$config = [];
+$configFile = __DIR__ . '/../config.php';
+if (file_exists($configFile)) {
+    $config = include $configFile;
+}
+App::instance($config)->run();
